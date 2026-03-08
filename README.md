@@ -23,11 +23,14 @@ refreshd --quiet --mindelay 1 --mininterval 1 -- ~/Projects/foo/src make foo
 ```
 
 This program relies on Linux’s “inotify” interface, so is Linux-only.
+It also probably relies on a lot of GNU-specific behavior (such as the behavior of GNU Getopt),
+another reason it‘s Linux-only.
 
 ## Dependencies
 
 * Bash (tested with Bash 5.3.3)
 * inotify-tools (tested with inotify-tools 4.25.9.0)
+* procps (tested with procps 4.0.4)
 
 ## Support and Bug Reports
 
