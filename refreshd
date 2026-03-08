@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+
+# --------------------------------------------------------------------------------------------------
+# Synopsis
+#
+
+# This program recursively watches a directory for changes and runs a command in response to those
+# changes. It includes built-in rate limiting so that the (potentially expensive-to-run) command
+# isn't run too often, and especially isn't run multiple times concurrently.
+#
+
+# --------------------------------------------------------------------------------------------------
+
+set -o errexit -o pipefail
+
+YELL () {
+    echo "$@" >&2 || true
+    exit 2
+}
+
+BUG () {
+    echo BUG "$0 line ${BASH_LINENO[0]}:" "$@" >&2 || true
+    pkill -TERM -P "$$"
+}
+
+LOG () {
+    if test ! "$quiet"
+    then
+        echo "$0:" "$@" >&2 || true
+    fi
+}
+
+VERBOSE () {
+    if test "$verbose"
+    then
+        LOG "$@"
+    fi
+}
+
+# --------------------------------------------------------------------------------------------------
+# Replacements for Unsatisfactory Commands and Shell Builtins
+#
+
+# Usage: escape ARGS...
+#
+# Escape each element in ARGS, producing a single formatted string suitable for passing to `eval` or
+# `read -a`.
+#
+escape () {
+    case $# in
+        0) printf '\n';;
+        1) printf '%q\n' "$1";;
+        *)
+            local _first=$1
+            shift
+            printf '%q%s\n' "$_first" "$(printf ' %q' "$@")"
+            ;;
+    esac
+}
+
+# Usage: mkpipe NAME
+#
+# Create an anonymous pipe, and set the variable NAME to the fd of the newly created pipe. Unlike a
+# bare `mkfifo`, there is no need to clean anything up on process exit because we immediately remove
+# any temporary files we create. Also, we're less likely to accidentally SIGPIPE ourselves because
+# the process that creates the pipe also keeps an open connection to each end of it unless
+# explicitly closed.
+#
+mkpipe () {
+    local _pipevar=${1:?"Expected use: mkpipe VARIABLE_NAME"}
+    local _tmpname=$(mktemp -d)
+    mkfifo "$_tmpname/fifo"
+    # Open each end of the pipe as a separate fd.
+    # They first have to be opened together as a single fd so we don't hang.
+    # But we then must close that single fd and must not redirect it, because opening both ends of
+    # a pipe while only intending to use one end of it means we'll never know when there's no one
+    # left on the other end.
+    local _fifo_inout _fifo_in _fifo_out
+    exec {_fifo_inout}<>"$_tmpname/fifo"
+    exec {_fifo_in}<"$_tmpname/fifo" {_fifo_out}>"$_tmpname/fifo"
+    exec {_fifo_inout}>&-
+    rm -r "$_tmpname"
+    eval "$_pipevar=( \$_fifo_in \$_fifo_out )"
+}
+
+exec {real_stdout}>&1
+async_preserve_fd=( [0]=y [1]=y [2]=y [$real_stdout]=y )
+
+# Usage: async COMMAND ARGS... REDIRECTIONS...
+#
+# Run a command asynchronously with saner behavior than a bare `&` or `coproc`.
+#
+# All we really want from an asynchronous command are six things:
+#   - it runs in parallel with the parent shell;
+#   - it shows up differently from the parent shell in log messages;
+#   - we can run as many instances of it as we want;
+#   - we can redirect its input and output arbitrarily like any other command;
+#   - it doesn't leave unused inherited fds open; and
+#   - it doesn't leave orphaned processes when killed by the parent shell.
+#
+# Each of the Bash shell builtins we might use does at most three of these things. This does all six.
+#
+async () {
+    local _argv0=$BASH_ARGV0
+    BASH_ARGV0="$_argv0 :$@"
+    {
+        VERBOSE STARTED
+        trap _term_children EXIT
+        # From https://unix.stackexchange.com/a/675386
+        for path in /proc/self/fd/*
+        do
+            fd=${path##*/}
+            if test "${async_preserve_fd[$fd]}" != 'y'
+            then
+                exec {fd}>&-
+            fi
+        done
+        "$@"
+    } <&0 &
+    BASH_ARGV0=$_argv0
+}
+
+_term_children () {
+    VERBOSE "Sending SIGTERM to child processes..."
+    if pgrep -P "$BASHPID" >/dev/null
+    then
+        pkill -TERM -P "$BASHPID" >&2 || LOG "WARNING: pkill failed ($?)"
+    fi
+    until wait
+    do
+        :
+    done
+    VERBOSE "DONE"
+}
+
+_cleanup () {
+    :
+}
+
+trap '_term_children; _cleanup' EXIT
+
+# --------------------------------------------------------------------------------------------------
+# Configuration
+#
+
+usage="Expected use: $0 [OPTIONS] MONITORED ACTION [ACTION_ARGS]"
+
+eval set -- "$(getopt -l verbose -l quiet -l mindelay: -l mininterval: -o '+q' -- "$@")"
+
+while true
+do
+    case "$1" in
+        '--verbose')
+            verbose=y
+            shift 1
+            ;;
+        '-q'|'--quiet')
+            quiet=y
+            shift 1
+            ;;
+        '--mindelay')
+            min_refresh_delay_seconds="$2"
+            shift 2
+            ;;
+        '--mininterval')
+            min_refresh_interval_seconds="$2"
+            shift 2
+            ;;
+        '--')
+            shift
+            break
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+monitored=$1
+refresh_action=$2
+
+test "$monitored" || YELL "$usage"
+test "$refresh_action" || YELL "$usage"
+
+VERBOSE mindelay=${min_refresh_delay_seconds:=1}
+VERBOSE mininterval=${min_refresh_interval_seconds:=5}
+VERBOSE monitored=${monitored}
+VERBOSE refresh_action=${refresh_action}
+
+shift 2
+refresh_args=( "$@" )
+
+# --------------------------------------------------------------------------------------------------
+# Event sources
+#
+
+watch () {
+    inotifywait -m --format '%e:%w%f' -r -e modify -e moved_to -e moved_from -e create -e delete "$1" \
+    | while
+        read message
+    do
+        LOG $(escape "$message")
+        escape schedule
+    done
+}
+
+# --------------------------------------------------------------------------------------------------
+# Event loop state
+#
+
+# Control scheduling of future refresh events.
+now=0
+effective_refresh_delay=$min_refresh_delay_seconds
+effective_refresh_interval=$min_refresh_interval_seconds
+last_refresh_finished_time=0
+next_refresh_scheduled_time=0
+
+# Control event interlocking.
+now_seq=0
+last_refresh_started_seq=0
+last_refresh_finished_seq=0
+reschedule_seq=0
+
+# --------------------------------------------------------------------------------------------------
+# Event loop handlers
+#
+
+# Usage: on_schedule
+on_schedule () {
+
+    # Are we in the middle of another refresh?
+    # If so, then wait until the end of that refresh to schedule the next one.
+    if test "$last_refresh_started_seq" -gt "$last_refresh_finished_seq"
+    then
+        VERBOSE ':schedule: will reschedule after current refresh'
+        reschedule_seq=$now_seq
+        return
+    fi
+
+    # Do we need to rate-limit?
+    local scheduled_time=$(( (now) + (effective_refresh_delay) ))
+    if test "$scheduled_time" -lt $(( (last_refresh_finished_time) + (effective_refresh_interval) ))
+    then
+        VERBOSE ':schedule: enforcing refresh interval'
+        scheduled_time=$(( (last_refresh_finished_time) + (effective_refresh_interval) ))
+    fi
+
+    # Do we already have a refresh scheduled between now and the scheduled time?
+    # If so, then we don't need to schedule another one.
+    if test "$next_refresh_scheduled_time" -gt "$now" \
+    && test "$next_refresh_scheduled_time" -le "$scheduled_time"
+    then
+        VERBOSE ':schedule: already scheduled'
+        return
+    fi
+
+    next_refresh_scheduled_time=$scheduled_time
+
+    {
+        sleep "$((scheduled_time - now))"
+        escape refresh "$now_seq"
+    } &
+}
+
+# Usage: on_force
+on_force () {
+    effective_refresh_delay=0
+    effective_refresh_interval=0
+    on_schedule
+}
+
+# Usage: on_refresh SINCE_SEQ
+on_refresh () {
+
+    # Are we in the middle of another refresh?
+    # If so, then we can't start this one.
+    if test "$last_refresh_started_seq" -gt "$last_refresh_finished_seq"
+    then
+        VERBOSE ':refresh: already refreshing'
+        return
+    fi
+
+    # Undo the effect of a 'force' event.
+    effective_refresh_delay=$min_refresh_delay_seconds
+    effective_refresh_interval=$min_refresh_interval_seconds
+
+    # Was another refresh started since we scheduled this one?
+    # If so, then we no longer need this refresh.
+    if test "$last_refresh_started_seq" -gt "$1"
+    then
+        VERBOSE ':refresh: no refresh needed'
+        return
+    fi
+
+    LOG ':refresh:'
+
+    last_refresh_started_seq=$now_seq
+
+    {
+        "$refresh_action" "${refresh_args[@]}" >&$real_stdout || LOG 'Refresh failed'
+        escape refresh_done
+    } &
+}
+
+# Usage: on_refresh_done
+on_refresh_done () {
+
+    LOG ':refresh_done:'
+
+    last_refresh_finished_time=$now
+    last_refresh_finished_seq=$now_seq
+
+    # Did we skip scheduling a refresh because of the one that just finished?
+    # If so, it must be scheduled now.
+    if test "$reschedule_seq" -gt "$last_refresh_started_seq"
+    then
+        VERBOSE ':refresh_done: rescheduling missed refresh'
+        on_schedule
+    fi
+}
+
+on_quit () {
+    exit 0
+}
+
+# --------------------------------------------------------------------------------------------------
+# Event loop dispatcher
+#
+
+on_event () {
+    now=$(date +%s)
+    now_seq=$(( (now_seq) + 1 ))
+    VERBOSE "now=$now" "seq=$now_seq" "$(escape "$@")"
+    local event=$1
+    shift
+    case "$event" in
+        schedule|force|refresh|refresh_done|quit) "on_$event" "$@";;
+        *) LOG "Unkown event $event";;
+    esac
+}
+
+event_loop () {
+    while
+        read -a event_args
+    do
+        on_event "${event_args[@]}"
+    done
+}
+
+# --------------------------------------------------------------------------------------------------
+# Control
+#
+
+mkpipe events
+
+async event_loop <&${events[0]} >&${events[1]}
+async watch "$monitored" </dev/null >&${events[1]}
+
+exec {events[0]}>&-
+
+while
+    read command command_args
+do
+    # Doing this without subshell would kill the entire script before we could log why.
+    if ! (printf '%s %s\n' "$command" "$command_args" >&${events[1]})
+    then
+        LOG 'Lost connection to event loop'
+        break
+    fi
+    if test "$command" = quit
+    then
+        break
+    fi
+done
