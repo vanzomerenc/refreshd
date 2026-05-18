@@ -157,7 +157,12 @@ trap '_term_children; _cleanup' EXIT
 
 usage="Expected use: $0 [OPTIONS] MONITORED ACTION [ACTION_ARGS]"
 
-eval set -- "$(getopt -l help -l verbose -l quiet -l mindelay: -l mininterval: -l exclude -o '+hq' -- "$@")"
+if ! getopt_output=$(getopt -l help -l verbose -l quiet -l mindelay: -l mininterval: -l exclude: -o '+hq' -- "$@")
+then
+    YELL "$usage"
+fi
+
+eval set -- "$getopt_output"
 
 while true
 do
